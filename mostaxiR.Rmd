@@ -1,0 +1,320 @@
+```{r libraries,echo=FALSE,message=FALSE,warning=FALSE}
+require(data.table)
+require(stringdist)
+require(reshape2)
+require(ggplot2)
+opts_chunk$set(dev="png",dev.args=list(type="cairo"),dpi=72)
+```
+# Анализ и визуализация реальных табличных данных в R
+Материал будет полезен тем, кто осваивает язык R в качестве инструмента анализа табличных данных и хочет увидеть сквозной пример реализации основных шагов обработки.
+Ниже демонстрируется загрузка данных из csv-файлов, разбор текстовых строк с элементами очистки данных, агрегация данных по аналитическим измерениям и построение диаграмм.
+
+В примере активно используется функциональность пакетов data.table, reshape2, stringdist и ggplot2.
+
+## Исходные данные
+В качестве "реальных данных" взята информация о выданных разрешениях на осуществление деятельности по перевозке пассажиров и багажа легковым такси в Москве. Данные предоставлены в общее пользование Департаментом транспорта и развития дорожно-транспортной инфраструктуры города Москвы. Страница набора данных http://data.mos.ru/datasets/655
+
+Исходные данные имеют следующий формат:
+```
+ROWNUM;VEHICLE_NUM;FULL_NAME;BLANK_NUM;VEHICLE_BRAND_MODEL;INN;OGRN
+1;"А248УЕ197";"ООО «ТАКСИ-АВТОЛАЙН»";"017263";"FORD FOCUS";"7734653292";"1117746207578"
+2;"А249УЕ197";"ООО «ТАКСИ-АВТОЛАЙН»";"017264";"FORD FOCUS";"7734653292";"1117746207578"
+3;"А245УЕ197";"ООО «ТАКСИ-АВТОЛАЙН»";"017265";"FORD FOCUS";"7734653292";"1117746207578"
+...
+```
+### 1. Загрузка первичных данных
+Данные можно загружать непосредсвенно с сайта. В процессе загрузки сразу переименуем колонки удобным образом.
+```{r dataload,tidy=FALSE,cache=TRUE}
+url <- "http://data.mos.ru/datasets/download/655"
+colnames = c("RowNumber", "RegPlate", "LegalName", "DocNum", "Car", "INN", "OGRN", "Void")
+rawdata <- read.table(url, header = TRUE, sep = ";",
+             colClasses = c("numeric", rep("character",6), NA),
+             col.names = colnames,
+             strip.white = TRUE,
+             blank.lines.skip = TRUE,
+             stringsAsFactors = FALSE,
+             encoding = "UTF-8")
+```
+Загружено строк: `r nrow(rawdata)`.
+
+### 2. Преобразование данных
+Предположим, что необходимо проанализировать распределение количества зарегистрированных в качестве такси автомобилей, в зависимости от организационной формы лицензиата и от марки автомобиля. Соответствующие данные не выделены отдельно, но вся нужная информация содержится в полях FULL_NAME (переименовано в LegalName) и VEHICLE_BRAND_MODEL (Car).
+В процессе пребразования исходных данных необходимо
+ - из поля LegalName выделить организационно-правовую форму в отдельное поле OrgType;
+ - из поля Car выделить марку машины в отдельное поле CarBrand;
+ - отбросить неиспользуемые поля.
+
+Для простоты считаем, что первые слова полей **LegalName** и **Car** составляют, соответственно, организационно-правовую форму и марку машины (ниже будет понятно, что делать с исключениями). Ненужные поля будут отброшены автоматически в процессе преобразования *data.frame* в *data.table* с явным указанием списка переносимых полей.
+```{r split_into_new,tidy=FALSE}
+ptn <- "^(.+?) (.+)$" # regexp pattern to match first word
+dt <- data.table(rawdata)[, 
+            list(RegPlate, LegalName, Car, OGRN,
+                 OrgType  = gsub(ptn, "\\1" , toupper( LegalName )),
+                 CarBrand = gsub(ptn, "\\1",  toupper( Car      )))                          
+            ]
+rm(rawdata) # Clear some memory
+```
+### 3. Первые итоги
+Проверим, какие организационные формы были выделены из данных.
+```{r cars_by_OrgType,tidy=FALSE}
+sort( table(dt$OrgType) )
+```
+Данные сформированы вполне корректно: по количеству полученных лицензий лидируют индивидуальные предприниматели (снижение налоговой нагрузки?), есть общества с ограниченной ответственностью, открытые и закрытые акционерные общества и даже одно некоммерческое партнерство.
+
+Для того, чтобы определить, сколько независимых **лицензиатов** (а не автомобилей) получили лицензию, в зависимости от организационно-правовой формы, необходимо провести суммирование по полю, уникально характеризующему юридическое лицо (ОГРН).
+```{r licensees_by_OrgType,tidy=FALSE}
+dt[, list( N = length( unique(OGRN) ) ), by = OrgType][order(N, decreasing = TRUE)]
+```
+## Очистка данных
+Автомобили каких марок используются в качестве такси в Москве? 
+
+В наборе данных представлено немало марок автомобилей: `r length( unique(dt$CarBrand))`, но действительно ли они все уникальные? Для примера выведем все марки, начинающиеся на букву "M".
+```{r car_brands_dirty,tidy=FALSE}
+sort( unique( dt[grep("^M.*", CarBrand), CarBrand]))
+
+```
+К сожалению, большое число марок машин во многом обусловлено ошибками в данных. К примеру, одна и та же марка - MERCEDES-BENZ - встречается под различными именами. Перед анализом данные необходимо очистить.
+
+Программная основа для очистки текстовой информации - функции поиска "расстояния между строками". Для каждой пары строк они вычисляют метрику, характеризующую трудоемкость преобразования одной строки в другую с помощью операций над буквами. Чем более похожи строки, тем меньше требуется операций. В идеале одинаковые строки должны иметь расстояние, равное нулю, а максимально непохожие - единице. Именно так и работает алгоритм Jaro-Winkler функции stringdist одноименного пакета. 
+
+Сравним несколько строк, только посчитаем не расстояние, а похожесть, 1-stringdist.
+```{r stringdist_example_1,tidy=FALSE}
+1 - stringdist( c("MERCEDES","MERSEDES","MAZDA","RENAULT","SAAB"), "MERCEDES", method = "jw", p = 0.1)
+
+```
+На первый взгляд задача очистки данных решается просто: для каждой записи достаточно выбрать наиболее похожее значение из справочника. К сожалению, такой подход не всегда работает. Во-первых, справочника может не быть (как в текущем случае). Во-вторых, некоторые ситуации требуют ручной коррекции данных, даже при наличии точного справочника. Например, с точки зрения метода три марки одинаково подходят в качестве альтернативы неверному значению "BAZ":
+```{r stringdist_example_2,tidy=FALSE}
+1 - stringdist("BAZ", c("VAZ", "UAZ", "ZAZ"), method = "jw", p = 0.1)
+
+```
+Ниже использован полуавтоматический метод коррекции, позволяющий существенно облегчить труд специалиста по очистке данных за счет программной генерации вариантов исправлений, с которыми аналитик может либо согласиться, либо вручную поправить. 
+
+Предполагается, что в большом объеме данных с малым количеством ошибок часто встречающиеся значения - корректные, а редко встречающиеся - ошибки. Частоты значений используются в качестве весового коэффициента, пропорционально увеличивая метрику близости строк. Чтобы часто встречающиеся марки машин не выходили вперед за счет количества, а не похожести, учитываются только метрики значений со степенью похожести выше порогового значения t (о выборе t позже). Для каждого возможного значения марки машины, таким образом, определяется рекомендованное "справочное" значение из того же набора данных. Пары "марка - предложенное исправление" выводятся в csv-файл. После анализа и внесения исправлений скорректировнный csv-файл загружается и служит словарем.
+
+Начнем с конструирования функции, возвращающей наилучшее соответствие на имеющемся наборе данных.
+```{r bestmatch.gen,tidy=FALSE}
+bestmatch.gen <- function(wc, t = 0){
+  # wc = counts of all base text words
+  # t = threshold: only the words with similarity above threshold count
+          
+  bestmatch <- function(a){
+    sim <- 1 - stringdist( toupper(a), toupper( names(wc) ) , method = "jw", p = 0.1 )
+    # Compute weights and implicitly cut off everything below threshold
+    weights <- sim * wc * (sim > t)
+    # Return the one with maximum combined weight
+    names( sort(weights, decr = TRUE)[1] )
+  }
+  bestmatch
+}
+
+```
+Пороговое значение t подбирается опытным путем. Вот пример работы функции для порогового параметра t = 0.7.
+```{r bestmatch_example_1,tidy=FALSE}
+  bm07 <- bestmatch.gen( table( dt$CarBrand), t = 0.7 )
+  s <- c("FORD","RENO","MERS","PEGO")
+  sapply(s, bm07)
+```
+На первый взгляд, все сработало чудесно. Однако радоваться рано. Хорошо представленные в наборе данных марки машин с похожими названиями могут "перетягивать на себя" другие корректные названия.
+```{r bestmatch_example_2}
+  s <- c("HONDA","CHRYSLER","VOLVO")
+  sapply(s, bm07)
+```
+Попробуем повысить пороговое значение t.
+```{r bestmatch_example_3,tidy=FALSE}
+  bm09 <- bestmatch.gen( table( dt$CarBrand), t = 0.9 )
+  s <- c("HONDA","CHRYSLER","VOLVO")
+  sapply(s, bm09)
+```
+Все в порядке? Почти. Слишком жесткое отсечение непохожих строк приводит к тому, что алгоритм считает некоторые ошибочные значения корректными. Подобные ошибки придется исправить вручную.
+```{r bestmatch_example_4}
+  s <- c("CEAT","CVEVROLET")
+  sapply(s, bm09)
+```
+----
+Теперь все готово для формирования файла словаря уникальных значений марок машин. Так как файл нужно будет править руками, удобно, если в нем будут дополнительные поля, показывающие, отличается ли предложенная замена от исходного значения (это не всегда очевидно), насколько часто встречается название марки, а также метка, привлекающая внимание к записи в зависимости от каких-то статистических характеристик набора. В данном случае мы хотим выловить ситуации, в которых алгоритм предлагает редко встречающиеся (предположительно ошибочные) значения в качестве корректных.
+```{r cbdict_out,tidy=FALSE}
+ncb <- table(dt$CarBrand)
+scb <- names(ncb) # Source Car Brands
+acb <- sapply(scb, bm09) # Auto-generated replacement
+cbdict_out <- data.table(ncb)[,list(
+                SourceName = scb,
+                AutoName = acb,
+                SourceFreq = as.numeric(ncb),
+                AutoFreq = as.numeric( ncb[acb] ),
+                Action = ordered( scb == acb, labels = c("CHANGE","KEEP")),
+                DictName = acb
+              )]
+# Add alert flag
+# Alert when suggested is a low-frequency dictionary word
+cbdict_out <- cbdict_out[,
+                Alert := ordered( AutoFreq <= quantile(AutoFreq, probs = 0.05, na.rm = TRUE),                   
+                labels = c("GOOD","ALERT"))
+                ]
+write.table( cbdict_out[ order(SourceName), 
+                         list( Alert, Action, SourceName, AutoName, SourceFreq, AutoFreq, DictName) 
+                       ], 
+            "cbdict_out.txt", sep = ";", quote = TRUE, 
+            col.names = TRUE, row.name = FALSE, fileEncoding = "UTF-8")                      
+```
+Необходимо проверить и отредактировать значения поля DictName и сохранить файл под именем "cbdict_in.txt" для последующей загрузки.
+Анализируемый набор данных имеет особенности, на которые стоит обратить внимание:
+- некоторые строки не содержат марки машины - пусто или "НЕТ", а некоторые модели сложно однознвчно идентицифировать: L1H1, M214; вручную меняем на UNKNOWN или аналогичное псевдо-значение;
+- равноправно применяется два варианта написания: MERCEDES и MERCEDES-BENZ, оставляем одно, MERCEDES-BENZ;
+- есть два визуально одинаковых независимых написания ZAZ (в выводе две строки, и обе ллгоритм предлагает сохранить как верные, Action = KEEP); видимо, где-то вкралась буква с другим кодом UTF-8;
+- некоторые названия машин не содержат марки, а тольмко модель: SAMAND (IRAN KHODRO)
+- неразбериха с марками TAGAZ - VORTEX и JAC; предлагается для простоты присвоить (пусть не совсем корректно) общее название TAGAZ машинам, чьи марки определились как TAGAZ, A21, SUV, SUVT11, VORTEX, JAC.
+
+Помимо особенностей данных есть ограничения алгоритма, которые нужно корректировать вручную.
+- алгоритм предлагает некоторые ошибочные названия в качестве корректных альтернатив: CEAT, CVEVROLET;
+- марки состоящие из двух слов, сокрашаются до одного: ALFA (ALFA ROMEO), GREAT (GREAT WALL), IRAN (IRAN KHODRO), LAND (LAND ROVER).
+
+Отредактированные данные загружаем из файла cbdict_in.txt
+```{r cbdict_in,tidy=FALSE}
+if ( file.exists("cbdict_in.txt")) url <- "cbdict_in.txt" else url <- "cbdict_out.txt"
+
+cbdict_in <- read.table( url, header = TRUE, sep = ";",
+                         colClasses = c( rep("character",4), "numeric", "numeric", "character"),
+                         encoding = "UTF-8")
+
+cbdict <- cbdict_in$DictName
+names(cbdict) <- cbdict_in$SourceName                   
+```
+И исправляем значения марок машин в таблице данных.
+```{r fix_carbrand,tidy=FALSE,results='hide'}
+dt[, CarBrand := cbdict[CarBrand]]
+dt[is.na(CarBrand), CarBrand := "UNKNOWN"]
+
+```
+После очистки уникальных значений марок машин стало меньше практически в два раза
+```{r num_car_brands_cleaned,tidy=FALSE}
+length( unique(dt$CarBrand) )
+```
+
+## Ответы на аналитические вопросы
+### 1. Top 10 организаций
+Определим 10 наиболее крупных таксопарков. В данном случае необходимо построить рейтинг по одному измерению - ОГРН.
+```{r top10,tidy=FALSE}
+st <- dt[, list( NumCars = length(RegPlate)), by = list(OGRN, LegalName) ]
+head( st[order( NumCars, decreasing = TRUE)], 10)
+```
+К сожалению, в рассматриваемом наборе данных хранится только юридическая информация о лицензиатах, а не торговая марка. В Интернете возможно по названию организации и ОГРН найти, под каким брендом работает таксопарк, но этот процесс не автоматический. Результаты поиска наиболее крупных таксопарков собраны в файле "top10orgs.csv".
+```{r top10_orgbrands,tidy=FALSE}
+top10orgs <- data.table( read.table( "top10orgs.csv", 
+  header = TRUE, sep = ";", colClasses = "character", encoding = "UTF-8"))
+```
+Воспользуемся встроенными возможностями data.table по проведению операции JOIN двух таблиц.
+```{r top10_plus_brand,tidy=FALSE}
+setkey(top10orgs,OGRN)
+setkey(st,OGRN)
+st[top10orgs][order(NumCars, decreasing = TRUE), list(OrgBrand, EasyPhone, NumCars)]
+```
+### 2. Три наиболее популярные автомарки, в зависимости от формы юридического лица
+Какие марки машин наиболее популярны, в завимимости от юридической формы лицензиата? Для ответа на этот вопрос нужно провести агрегацию данных по двум измерениям - марка машины и орформа.
+
+Процесс идет в три этапа:
+- 1. Вычисление агрегированного показателя (в данном случае число машин по ОГРН).
+- 2. Вычисление ранга.
+- 3. Ограничение ранга (top 3), сортировка, перераспределение колонок и вывод данных.
+```{r top3_by_orgtype,tidy=FALSE}
+st <- dt[, list(AGGR = length(RegPlate)), by = list(OrgType, CarBrand) ]
+st.r <- st[, list(CarBrand, AGGR, 
+                  r = ( 1 + length(AGGR) - rank(AGGR, ties.method="first"))), 
+           by = list(OrgType)] # ranking by one dimension
+st.out <- st.r[ r <= 3 ][, list(r, OrgType, cval = paste0(CarBrand," (",AGGR,")"))]
+dcast(st.out, r ~ OrgType, value.var = "cval")[-1] # reshape data and hide r
+```
+## Визуализация
+### 1. Отображение данных в виде круговой диаграммы
+Круговая (секторная) диаграмма, Pie Chart, весьма популярна в бизнес-среде, но подвергается обоснованной критике профессионалами анализа данных. Тем не менее, ее нужно уметь "готовить".
+Пусть требуется отобразить распределение числа лицензий такси, по автомаркам. Чтобы не перегружать диаграмму покажем только марки с количеством лицензий не меньше 1000.
+```{r pie_pre_1,tidy=FALSE}
+st <- dt[, list(N = length(RegPlate)), by = CarBrand ] # Summary table
+st <- st[, CarBrand := reorder(CarBrand, N) ]
+piedata <- rbind(
+  st[ N >= 1000 ][ order(N, decreasing=T) ],
+  data.table( CarBrand = "Другие марки", N = sum( st[N < 1000]$N) )
+  )
+piedata
+```
+Для построения графика хотелось бы зафиксировать именно такой порядок следования марок. Если этого не сделать, то автоматическая сортировка выведет "Другие марки" с последнего места на первое.
+```{r pie_pre_2,tidy=FALSE}
+piedata <- piedata[, CarBrand := factor(CarBrand, levels = CarBrand, ordered = TRUE)]
+```
+Для построения диаграммы используем ggplot2.
+```{r pie_1,tidy=FALSE,warning=FALSE,fig.height=4,fig.width=6,fig.align='center'}
+pie <-  ggplot(piedata, aes( x = "", y = N, fill = CarBrand)) + 
+        geom_bar(stat = "identity") +
+        coord_polar(theta = "y")
+pie
+```
+Вывод уже достаточно информативен. Однако хотелось бы внести ряд визуальных улучшений:
+- убрать серый фон, границы, круговую ось, подписи и отметки;
+- выбрать более различимую цветовую шкалу и обвести каждый "кусок пирога";
+- рядом с каждым сектором проставить число лицензий, соотвествующее марке;
+- дать текстовое название легенде.
+
+Код ниже позволяет сделать все перечисленное. Для отображения надписей рядом с секторами пришлось добавить поле с расчетом точки центра сектора (подсмотрено у [artelstatistikov.ru](http://artelstatistikov.ru/r/krugovaya-diagramma-v-r-c-pomoshh-yu-ggplot-krasny-e-zelyony-e-zolotopogonny-e.html))
+```{r pie_2,tidy=FALSE,warning=FALSE,fig.height=5,fig.width=7,fig.align='center'}
+piedata <- piedata[, pos := cumsum(N) - 0.5*N ]
+pie <-  ggplot(piedata, aes( x = "", y = N, fill = CarBrand)) +
+        geom_bar( color = "black", stat = "identity", width = 0.5) +
+        geom_text( aes(label = N, y = pos), x = 1.4, color = "black", size = 5) +
+        scale_fill_brewer(palette = "Paired", name = "Марки авто") +
+        coord_polar(theta = "y") +
+        theme_bw() +
+        theme ( panel.border = element_blank()
+              , panel.grid.major = element_blank()
+              , axis.ticks = element_blank()
+              , axis.title.x = element_blank()
+              , axis.title.y = element_blank()
+              , axis.text.x = element_blank()
+              , legend.title = element_text(face="plain", size=16)
+              )
+pie
+```
+### 2. Столбчатая диаграмма
+Более информативная альтернатива кругу - столбчатая диаграмма, Bar Chart. Помимо того, что длины столбиков удобнее сравнивать, чем длины дуг или площади секторов круга, столбчатая диаграмма может дополнительно отобразить, например, распределении числа лицензий по оргформам.
+```{r bar,tidy=FALSE,warning=FALSE,fig.height=5,fig.width=7,fig.align='center'}
+st <- dt[, list(N = length(RegPlate)), by = list(OrgType, CarBrand) ] # Summary table
+cbsort <- st[, list( S = sum(N) ), keyby = CarBrand ] # Order by total number
+setkey(st, CarBrand)
+st <- st[cbsort] # Join
+
+topcb <- st[ S >= 1000 ][ order(S) ]
+bottomcb <- st[S < 1000, list(CarBrand = "Другие марки", OrgType, N = sum(N)), by = OrgType]
+bottomcb <- bottomcb[, list(CarBrand, OrgType, N, S = sum(N))]
+
+bardata <- rbind( bottomcb, topcb)  
+bardata <- bardata[, CarBrand := factor(CarBrand, levels = unique(CarBrand), ordered=T)]
+#
+bar <-  ggplot(bardata, aes(x = CarBrand, weight = N, fill = OrgType)) +
+        geom_bar() + coord_flip() +
+        scale_fill_brewer(palette = "Spectral", name = "Оргформа") +
+        labs(list(y = "Количество лицензий", x = "Марки автомобилей")) +
+        theme_bw()
+bar
+```
+### 3. Диаграмма Heat Map (Теплокарта)
+Предположим, требуется получить ответ на вопрос: "Хозяева каких марок машин (среди таксистов) больше всего подвержены моде на «красивые» номера?". Красивыми в данном случае будем считать номера с одинаковыми цифрами в тройках: 111, 222 и т.д.
+Анализ ведется по двум аналитическим измерениям - марка машины и тройка. Показатель - количество машин с заданным сочетанием марки и тройки. Для визуализации такого набора данных хорошо подходит визуальный аналог таблицы - диаграмма heat map. Чем более популярна тройка, тем более интенсивный цвет кодирует значение ячейки.
+```{r lucky_numbers,tidy=FALSE,warning=FALSE,fig.height=5,fig.width=10,fig.align='center'}
+ln <- dt[grep( "^[^0-9]([0-9])\\1{2}.+$" , RegPlate),
+         list(CarBrand, LuckyNum = gsub("^[^0-9]([0-9]{3}).+$","\\1", RegPlate))]
+ln <- ln[, list( N = .N),  by = list(CarBrand, LuckyNum) ]
+ln <- ln[, Luck := sum(N), by = list(CarBrand) ] # Total number of lucky regplates per car brand
+ln <- ln[, CarBrand := reorder(CarBrand, Luck) ]
+#
+heatmap <-  ggplot(ln, aes(x = CarBrand, y = LuckyNum)) +  
+            geom_tile( aes(fill = as.character(N)), color = "black") + 
+            scale_fill_brewer(palette = "YlOrRd", name = "Число «красивых» номеров:") +
+            labs(list(x = "Марки автомобилей", y = "Номерные тройки")) +
+            theme_bw() +
+            theme ( panel.grid.major=element_blank()
+                    , axis.text.x = element_text(angle = 45, hjust = 1)
+                    , axis.title.y = element_text(vjust = 0.3)
+                    , legend.position = "top"
+                    , legend.title.align = 1
+            )
+heatmap
+```
+Во всех диаграммах использованы научно обоснованные цветовые палитры проекта [Color Brewer 2.0](http://colorbrewer2.org).
